@@ -111,6 +111,43 @@ class ExecutionLock {
     std::filesystem::path path_;
 };
 
+class ScanExecutionLock {
+  public:
+    explicit ScanExecutionLock(const std::filesystem::path& scan_root) {
+        const auto identity = std::to_string(std::hash<std::string>{}(scan_root.string()));
+        path_ = std::filesystem::temp_directory_path() /
+                ("kepp-worker-" + std::to_string(getuid()) + "-scan-" + identity + ".lock");
+        descriptor_ = open(path_.c_str(), O_CREAT | O_RDWR, 0600);
+        if (descriptor_ < 0)
+            throw std::runtime_error("Cannot open scan lock: " + std::string(std::strerror(errno)));
+        if (flock(descriptor_, LOCK_EX | LOCK_NB) != 0) {
+            if (errno == EWOULDBLOCK) {
+                close(descriptor_);
+                descriptor_ = -1;
+                return;
+            }
+            const auto message = std::string("Cannot acquire scan lock: ") + std::strerror(errno);
+            close(descriptor_);
+            descriptor_ = -1;
+            throw std::runtime_error(message);
+        }
+        acquired_ = true;
+    }
+    ~ScanExecutionLock() {
+        if (descriptor_ >= 0) {
+            flock(descriptor_, LOCK_UN);
+            close(descriptor_);
+        }
+    }
+    bool acquired() const { return acquired_; }
+    ScanExecutionLock(const ScanExecutionLock&) = delete;
+    ScanExecutionLock& operator=(const ScanExecutionLock&) = delete;
+  private:
+    int descriptor_ = -1;
+    bool acquired_ = false;
+    std::filesystem::path path_;
+};
+
 std::string read_file(FILE* file) {
     if (std::fseek(file, 0, SEEK_SET) != 0) throw std::runtime_error(std::strerror(errno));
     std::string result;
@@ -1118,6 +1155,13 @@ int main(int argc, char** argv) {
     try {
         const auto options = parse_options(argc, argv);
         if (!options.scan_root) return run(options);
+        const auto canonical_scan_root = std::filesystem::canonical(*options.scan_root);
+        ScanExecutionLock scan_lock(canonical_scan_root);
+        if (!scan_lock.acquired()) {
+            std::cout << "[worker] another scan is already running for "
+                      << canonical_scan_root << "; skipping\n";
+            return 0;
+        }
         log_stage("discovering repositories");
         const auto repositories = discover_repositories(options);
         size_t succeeded = 0;
